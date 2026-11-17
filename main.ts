@@ -8,10 +8,12 @@
 //   /mcp                             Model Context Protocol, streamable HTTP (mcp.ts)
 //
 // Every API call must carry the trial's token (MAKEFUN_SHOP_TOKEN) as a bearer token; a request without it
-// is 401. Every REST answer is JSON and carries an X-GitHub-Request-Id.
+// is 401. Every REST answer is JSON and carries an X-GitHub-Request-Id. The transport is http.ts, a lean
+// HTTP/1.1 server: every handler here is synchronous, so a request is parsed, answered and written in one go.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { ApiError } from './forge.ts';
+import { gunzipSync } from 'node:zlib';
+import { ApiError, mutations } from './forge.ts';
+import { createRawServer, type RawRequest, type RawResponse } from './http.ts';
 import { route } from './rest.ts';
 import { infoRefs, receivePack, uploadPack } from './smart.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -20,18 +22,19 @@ import { handleMcp } from './mcp.ts';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const JSON_TYPE = 'application/json; charset=utf-8';
+const BEARER = `Bearer ${TOKEN}`;
 
 let requestCounter = 0;
 function requestId(): string {
   requestCounter += 1;
-  return `F0RGE:${requestCounter.toString(16).toUpperCase().padStart(8, '0')}`;
+  return `F0RGE:${requestCounter.toString(16).toUpperCase()}`;
 }
 
 /** Whether the request carries the trial's token (bearer, token or basic with the token as password). */
-function authorized(req: IncomingMessage): boolean {
-  const header = req.headers.authorization;
+function authorized(header: string | undefined): boolean {
   if (TOKEN === '') return true;
-  if (typeof header !== 'string') return false;
+  if (header === undefined) return false;
+  if (header === BEARER) return true;
   const match = /^(\S+)\s+(.+)$/.exec(header.trim());
   if (match === null) return false;
   const scheme = match[1].toLowerCase();
@@ -44,163 +47,107 @@ function authorized(req: IncomingMessage): boolean {
   return false;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const base: Record<string, string> = { 'x-github-request-id': requestId(), 'x-github-media-type': 'github.v3; format=json', ...headers };
-  if (status === 204 || body === null || body === undefined) {
-    res.writeHead(status, { ...base, 'content-type': JSON_TYPE, 'content-length': '0' });
-    res.end();
-    return;
-  }
-  const text = JSON.stringify(body);
-  res.writeHead(status, { ...base, 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
+const REST_HEADERS = { 'x-oauth-scopes': 'repo, read:org, workflow', 'x-accepted-oauth-scopes': 'repo' };
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-function originOf(req: IncomingMessage): string {
-  const host = req.headers.host ?? '127.0.0.1';
-  return `http://${host}`;
+function json(status: number, body: unknown, headers: Record<string, string> = {}): RawResponse {
+  const out: Record<string, string> = { 'content-type': JSON_TYPE, 'x-github-request-id': requestId(), ...headers };
+  if (status === 204 || body === null || body === undefined) return { status, headers: out, body: null };
+  return { status, headers: out, body: typeof body === 'string' ? body : JSON.stringify(body) };
 }
 
 const GIT_PATH = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const method = req.method ?? 'GET';
-  const rawUrl = req.url ?? '/';
-  const q = rawUrl.indexOf('?');
-  let path = q < 0 ? rawUrl : rawUrl.slice(0, q);
-  const query = new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1));
-  try {
-    path = decodeURI(path);
-  } catch {
-    // keep the raw path
+function dispatch(req: RawRequest): RawResponse {
+  const { method, url, headers } = req;
+  if (method !== 'GET' && method !== 'HEAD') mutations.epoch += 1;
+  const q = url.indexOf('?');
+  let path = q < 0 ? url : url.slice(0, q);
+  const rawQuery = q < 0 ? '' : url.slice(q + 1);
+  if (path.includes('%')) {
+    try {
+      path = decodeURI(path);
+    } catch {
+      // keep the raw path
+    }
   }
+  const host = headers.host ?? '127.0.0.1';
+  const base = `http://${host}`;
 
-  if (path === '/healthz' || path === '/healthz/') {
-    sendJson(res, 200, { ok: true });
-    return;
+  if (path === '/healthz' || path === '/healthz/') return json(200, '{"ok":true}');
+
+  // ------------------------------------------------------------------ REST v3 (the hot path, first)
+  if (path.startsWith('/api/v3/') || path === '/api/v3') {
+    if (!authorized(headers.authorization)) {
+      return json(401, { message: 'Requires authentication', documentation_url: 'https://docs.github.com/rest' }, { 'www-authenticate': 'Bearer' });
+    }
+    let parsed: unknown = undefined;
+    if (req.body.length > 0) {
+      try {
+        parsed = JSON.parse(req.body.toString('utf8'));
+      } catch {
+        return json(400, { message: 'Problems parsing JSON', documentation_url: 'https://docs.github.com/rest' });
+      }
+    }
+    let sub = path.slice(7);
+    if (sub.endsWith('/')) sub = sub.replace(/\/+$/, '');
+    try {
+      const answer = route({ method, path: sub, query: new URLSearchParams(rawQuery), body: parsed, base });
+      return json(answer.status, answer.raw ?? answer.body, answer.headers === undefined ? REST_HEADERS : { ...REST_HEADERS, ...answer.headers });
+    } catch (err) {
+      if (err instanceof ApiError) return json(err.status, { message: err.message, ...err.extra, documentation_url: 'https://docs.github.com/rest' });
+      process.stderr.write(`[forge] ${method} ${path}: ${err instanceof Error ? err.stack : String(err)}\n`);
+      return json(500, { message: 'Server Error' });
+    }
   }
-
-  const body = await readBody(req);
 
   // ------------------------------------------------------------------ git smart HTTP
   const git = GIT_PATH.exec(path);
   if (git !== null) {
-    if (!authorized(req)) {
-      res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'www-authenticate': 'Basic realm="forge"' });
-      res.end('Authentication required\n');
-      return;
+    if (!authorized(headers.authorization)) {
+      return { status: 401, headers: { 'content-type': 'text/plain; charset=utf-8', 'www-authenticate': 'Basic realm="forge"' }, body: 'Authentication required\n' };
     }
     const [, owner, name, action] = git;
-    const protocol = String(req.headers['git-protocol'] ?? '');
+    const protocol = headers['git-protocol'] ?? '';
+    let body = req.body;
+    if ((headers['content-encoding'] ?? '').toLowerCase() === 'gzip') {
+      try {
+        body = gunzipSync(body);
+      } catch {
+        return { status: 400, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: 'bad gzip body\n' };
+      }
+    }
     let answer;
-    if (action === 'info/refs' && (method === 'GET' || method === 'HEAD')) answer = infoRefs(owner, name, query.get('service'), protocol);
-    else if (action === 'git-upload-pack' && method === 'POST') answer = uploadPack(owner, name, await inflateBody(req, body), protocol);
-    else if (action === 'git-receive-pack' && method === 'POST') answer = receivePack(owner, name, await inflateBody(req, body));
-    else answer = { status: 405, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: Buffer.from('Method Not Allowed\n') };
-    res.writeHead(answer.status, { ...answer.headers, 'content-length': answer.body.length });
-    res.end(method === 'HEAD' ? undefined : answer.body);
-    return;
+    if (action === 'info/refs' && (method === 'GET' || method === 'HEAD')) answer = infoRefs(owner, name, new URLSearchParams(rawQuery).get('service'), protocol);
+    else if (action === 'git-upload-pack' && method === 'POST') answer = uploadPack(owner, name, body, protocol);
+    else if (action === 'git-receive-pack' && method === 'POST') answer = receivePack(owner, name, body);
+    else return { status: 405, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: 'Method Not Allowed\n' };
+    return { status: answer.status, headers: answer.headers, body: answer.body };
   }
 
   // ------------------------------------------------------------------ MCP
   if (path === '/mcp' || path === '/mcp/') {
-    if (!authorized(req)) {
-      sendJson(res, 401, { jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized: a bearer token is required' } }, { 'www-authenticate': 'Bearer' });
-      return;
+    if (!authorized(headers.authorization)) {
+      return json(401, { jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized: a bearer token is required' } }, { 'www-authenticate': 'Bearer' });
     }
-    const answer = await handleMcp(method, req.headers, body, originOf(req));
-    if (answer.body === null) {
-      res.writeHead(answer.status, { ...answer.headers, 'content-length': '0' });
-      res.end();
-      return;
-    }
-    const text = typeof answer.body === 'string' ? answer.body : JSON.stringify(answer.body);
-    res.writeHead(answer.status, { 'content-type': JSON_TYPE, ...answer.headers, 'content-length': Buffer.byteLength(text) });
-    res.end(text);
-    return;
+    const answer = handleMcp(method, req.body, base);
+    if (answer.body === null) return { status: answer.status, headers: answer.headers, body: null };
+    return { status: answer.status, headers: { 'content-type': JSON_TYPE, ...answer.headers }, body: JSON.stringify(answer.body) };
   }
 
   // ------------------------------------------------------------------ GraphQL
   if (path === '/api/graphql' || path === '/api/graphql/' || path === '/graphql') {
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'This endpoint requires you to be authenticated.', documentation_url: 'https://docs.github.com/graphql' });
-      return;
-    }
-    if (method !== 'POST') {
-      sendJson(res, 405, { message: 'Method Not Allowed' });
-      return;
-    }
+    if (!authorized(headers.authorization)) return json(401, { message: 'This endpoint requires you to be authenticated.', documentation_url: 'https://docs.github.com/graphql' });
+    if (method !== 'POST') return json(405, { message: 'Method Not Allowed' });
     let parsed: unknown;
     try {
-      parsed = JSON.parse(body.toString('utf8'));
+      parsed = JSON.parse(req.body.toString('utf8'));
     } catch {
-      sendJson(res, 400, { message: 'Problems parsing JSON' });
-      return;
+      return json(400, { message: 'Problems parsing JSON' });
     }
-    sendJson(res, 200, handleGraphQL(parsed, originOf(req)));
-    return;
+    return json(200, handleGraphQL(parsed, base));
   }
 
-  // ------------------------------------------------------------------ REST v3
-  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'Requires authentication', documentation_url: 'https://docs.github.com/rest' }, { 'www-authenticate': 'Bearer' });
-      return;
-    }
-    let parsed: unknown = undefined;
-    if (body.length > 0) {
-      try {
-        parsed = JSON.parse(body.toString('utf8'));
-      } catch {
-        sendJson(res, 400, { message: 'Problems parsing JSON', documentation_url: 'https://docs.github.com/rest' });
-        return;
-      }
-    }
-    const sub = path.slice('/api/v3'.length).replace(/\/+$/, '');
-    try {
-      const answer = route({ method, path: sub, query, body: parsed, base: originOf(req) });
-      sendJson(res, answer.status, answer.body, { 'x-oauth-scopes': 'repo, read:org, workflow', 'x-accepted-oauth-scopes': 'repo', ...(answer.headers ?? {}) });
-    } catch (err) {
-      if (err instanceof ApiError) sendJson(res, err.status, { message: err.message, ...err.extra, documentation_url: 'https://docs.github.com/rest' });
-      else {
-        process.stderr.write(`[forge] ${method} ${path}: ${err instanceof Error ? err.stack : String(err)}\n`);
-        sendJson(res, 500, { message: 'Server Error' });
-      }
-    }
-    return;
-  }
-
-  sendJson(res, 404, { message: 'Not Found' });
-}
-
-/** A git client may gzip its request body. */
-async function inflateBody(req: IncomingMessage, body: Buffer): Promise<Buffer> {
-  if (String(req.headers['content-encoding'] ?? '').toLowerCase() !== 'gzip') return body;
-  const { gunzipSync } = await import('node:zlib');
-  return gunzipSync(body);
-}
-
-function createApp() {
-  const server = createServer((req, res) => {
-    handle(req, res).catch((err) => {
-      process.stderr.write(`[forge] unhandled: ${err instanceof Error ? err.stack : String(err)}\n`);
-      if (!res.headersSent) sendJson(res, 500, { message: 'Server Error' });
-      else res.destroy();
-    });
-  });
-  server.keepAliveTimeout = 120_000;
-  server.headersTimeout = 125_000;
-  server.requestTimeout = 0;
-  return server;
+  return json(404, { message: 'Not Found' });
 }
 
 // ---------------------------------------------------------------------- the lifecycle
@@ -242,7 +189,7 @@ async function waitForDone(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const server = createApp();
+  const server = createRawServer(dispatch);
   const wanted = ENV_URL === '' ? Number(process.env.PORT ?? 0) : 0;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);

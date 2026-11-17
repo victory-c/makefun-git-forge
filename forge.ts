@@ -146,6 +146,12 @@ export interface Repo {
 }
 
 export const store = new ObjectStore();
+
+/**
+ * Bumped by every request that may change state (any non-GET), so a GET answer cached at one epoch is
+ * served only while nothing at all has changed since.
+ */
+export const mutations = { epoch: 0 };
 const repos = new Map<string, Repo>();
 const reposById = new Map<number, Repo>();
 let nextRepoId = 100000;

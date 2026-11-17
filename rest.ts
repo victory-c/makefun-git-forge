@@ -25,6 +25,7 @@ import {
   listRepos,
   mergePull,
   mergeableOf,
+  mutations,
   pullBaseSha,
   pullCommits,
   pullFiles,
@@ -57,6 +58,8 @@ export interface RestAnswer {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** The body already serialized (a cached hot path); sent instead of `body` when set. */
+  raw?: string;
 }
 
 type Json = Record<string, unknown>;
@@ -804,14 +807,21 @@ on('GET', `${R}/issues/comments/{id}`, (req, [o, r, id]) => {
   }
   throw new ApiError(404, 'Not Found');
 });
+const issueCache = new Map<string, { epoch: number; raw: string }>();
 on('GET', `${R}/issues/{number}`, (req, [o, r, n]) => {
+  const key = `${o}\n${r}\n${n}\n${req.base}`;
+  const cached = issueCache.get(key);
+  if (cached !== undefined && cached.epoch === mutations.epoch) return { status: 200, body: null, raw: cached.raw };
   const repo = getRepo(o, r);
   const number = intParam(n);
   const pull = repo.pulls.get(number);
   if (pull !== undefined) {
     return { status: 200, body: { ...pullAsIssue(repo, pull, req.base) } };
   }
-  return { status: 200, body: issueJson(repo, getIssue(repo, number), req.base) };
+  const raw = JSON.stringify(issueJson(repo, getIssue(repo, number), req.base));
+  if (issueCache.size > 4096) issueCache.clear();
+  issueCache.set(key, { epoch: mutations.epoch, raw });
+  return { status: 200, body: null, raw };
 });
 on('PATCH', `${R}/issues/{number}`, (req, [o, r, n]) => {
   const repo = getRepo(o, r);

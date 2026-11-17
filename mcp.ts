@@ -359,7 +359,7 @@ function dispatch(message: unknown, base: string, headers: Record<string, string
   return isNotification ? null : { jsonrpc: '2.0', id, result };
 }
 
-export async function handleMcp(method: string, _headers: unknown, body: Buffer, base: string): Promise<McpAnswer> {
+export function handleMcp(method: string, body: Buffer, base: string): McpAnswer {
   if (method === 'DELETE') return { status: 204, headers: {}, body: null };
   if (method === 'GET') return { status: 405, headers: { allow: 'POST, DELETE' }, body: rpcError(null, -32000, 'Method Not Allowed: this server streams no notifications; POST requests') };
   if (method !== 'POST') return { status: 405, headers: { allow: 'POST, DELETE' }, body: rpcError(null, -32000, 'Method Not Allowed') };

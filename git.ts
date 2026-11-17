@@ -8,8 +8,13 @@
 //
 // Nothing here knows about HTTP or repositories; smart.ts builds the protocol on top of it.
 
-import { createHash } from 'node:crypto';
+import * as nodeCrypto from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
+import { inflateZlib } from './inflate.ts';
+
+const { createHash } = nodeCrypto;
+/** One-shot hashing (node >= 21.7) skips building a Hash object; older nodes fall back to createHash. */
+const oneShot = (nodeCrypto as unknown as { hash?: (algorithm: string, data: Buffer, encoding: 'hex') => string }).hash;
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 
@@ -24,6 +29,7 @@ const TYPE_CODE: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4
 const CODE_TYPE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
 export function hashObject(type: ObjType, data: Buffer): string {
+  if (oneShot !== undefined) return oneShot('sha1', Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'latin1'), data]), 'hex');
   const hash = createHash('sha1');
   hash.update(`${type} ${data.length}\0`);
   hash.update(data);
@@ -276,7 +282,17 @@ export function sideband(band: number, data: Buffer): Buffer[] {
 
 // ------------------------------------------------------------------------------------- packfiles
 
-function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
+/** Objects at most this big inflate in JavaScript (no zlib stream to build); bigger ones use node:zlib. */
+const JS_INFLATE_MAX = 64 * 1024;
+
+function inflateAt(buffer: Buffer, offset: number, size = -1): { data: Buffer; next: number } {
+  if (size >= 0 && size <= JS_INFLATE_MAX) {
+    try {
+      return inflateZlib(buffer, offset, size);
+    } catch {
+      // anything unusual (a preset dictionary, a damaged stream): let zlib decide
+    }
+  }
   const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   return { data: result.buffer, next: offset + result.engine.bytesWritten };
 }
@@ -361,7 +377,7 @@ export function ingestPack(store: ObjectStore, pack: Buffer): string[] {
         byte = pack[at++];
         rel = (rel + 1) * 128 + (byte & 0x7f);
       }
-      const inflated = inflateAt(pack, at);
+      const inflated = inflateAt(pack, at, size);
       at = inflated.next;
       const base = byOffset.get(start - rel);
       if (base === undefined) throw new Error('ofs-delta base not found');
@@ -373,7 +389,7 @@ export function ingestPack(store: ObjectStore, pack: Buffer): string[] {
     } else if (code === 7) {
       const baseSha = pack.toString('hex', at, at + 20);
       at += 20;
-      const inflated = inflateAt(pack, at);
+      const inflated = inflateAt(pack, at, size);
       at = inflated.next;
       const base = store.get(baseSha);
       if (base === undefined) {
@@ -388,7 +404,7 @@ export function ingestPack(store: ObjectStore, pack: Buffer): string[] {
     } else {
       const type = CODE_TYPE[code];
       if (type === undefined) throw new Error(`bad pack entry type ${code}`);
-      const inflated = inflateAt(pack, at);
+      const inflated = inflateAt(pack, at, size);
       at = inflated.next;
       if (inflated.data.length !== size) throw new Error('pack entry size mismatch');
       byOffset.set(start, { type, data: inflated.data });
