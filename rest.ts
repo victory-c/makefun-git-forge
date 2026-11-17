@@ -64,10 +64,18 @@ type Json = Record<string, unknown>;
 // ------------------------------------------------------------------------------------- ids and urls
 
 /** An opaque, stable global id: a type prefix and the base64 of the kind and database id. */
+const nodeIdCache = new Map<string, string>();
 export function nodeId(kind: string, id: number): string {
-  const prefix: Record<string, string> = { Repository: 'R_kgDO', Issue: 'I_kwDO', PullRequest: 'PR_kwDO', IssueComment: 'IC_kwDO', User: 'U_kgDO', Label: 'LA_kwDO' };
-  return `${prefix[kind] ?? 'N_'}${Buffer.from(`${kind}:${id}`).toString('base64url')}`;
+  const key = `${kind}:${id}`;
+  let value = nodeIdCache.get(key);
+  if (value === undefined) {
+    value = `${NODE_PREFIX[kind] ?? 'N_'}${Buffer.from(key).toString('base64url')}`;
+    nodeIdCache.set(key, value);
+  }
+  return value;
 }
+
+const NODE_PREFIX: Record<string, string> = { Repository: 'R_kgDO', Issue: 'I_kwDO', PullRequest: 'PR_kwDO', IssueComment: 'IC_kwDO', User: 'U_kgDO', Label: 'LA_kwDO' };
 
 export function decodeNodeId(id: string): { kind: string; id: number } | null {
   const at = id.indexOf('_kwDO') >= 0 ? id.indexOf('_kwDO') + 5 : id.indexOf('_kgDO') >= 0 ? id.indexOf('_kgDO') + 5 : id.startsWith('N_') ? 2 : -1;
@@ -77,8 +85,13 @@ export function decodeNodeId(id: string): { kind: string; id: number } | null {
   return match === null ? null : { kind: match[1], id: Number(match[2]) };
 }
 
+const userCache = new Map<string, Json>();
+
+/** The viewer as GitHub's simple-user object (one shared, frozen object per origin). */
 export function userJson(base: string): Json {
-  return {
+  const cached = userCache.get(base);
+  if (cached !== undefined) return cached;
+  const user = Object.freeze({
     login: VIEWER.login,
     id: VIEWER.id,
     node_id: nodeId('User', VIEWER.id),
@@ -89,7 +102,9 @@ export function userJson(base: string): Json {
     repos_url: `${base}/api/v3/users/${VIEWER.login}/repos`,
     type: 'User',
     site_admin: false,
-  };
+  });
+  userCache.set(base, user);
+  return user;
 }
 
 export function repoJson(repo: Repo, base: string): Json {
@@ -482,13 +497,63 @@ function branchJson(repo: Repo, name: string, sha: string, base: string, full: b
 
 type Handler = (req: RestRequest, params: string[]) => RestAnswer;
 
-const routes: { method: string; pattern: RegExp; handler: Handler }[] = [];
+/**
+ * The routes as a segment trie: a literal segment, one parameter segment ({name}) or a tail ({rest}, every
+ * remaining segment joined by '/'). Literals win over parameters, as the old ordered table did; a lookup costs
+ * one map read per path segment.
+ */
+interface TrieNode {
+  literal: Map<string, TrieNode>;
+  param: TrieNode | null;
+  rest: Map<string, Handler> | null;
+  handlers: Map<string, Handler>;
+}
+
+const newNode = (): TrieNode => ({ literal: new Map(), param: null, rest: null, handlers: new Map() });
+const trie = newNode();
 
 function on(method: string, pattern: string, handler: Handler): void {
-  const source = pattern
-    .replace(/\{rest\}/g, '(.*)')
-    .replace(/\{[a-z_]+\}/g, '([^/]+)');
-  routes.push({ method, pattern: new RegExp(`^${source}/?$`), handler });
+  let node = trie;
+  for (const segment of pattern.split('/').filter(Boolean)) {
+    if (segment === '{rest}') {
+      node.rest ??= new Map();
+      if (!node.rest.has(method)) node.rest.set(method, handler);
+      return;
+    }
+    if (segment.startsWith('{')) {
+      node.param ??= newNode();
+      node = node.param;
+    } else {
+      let next = node.literal.get(segment);
+      if (next === undefined) {
+        next = newNode();
+        node.literal.set(segment, next);
+      }
+      node = next;
+    }
+  }
+  if (!node.handlers.has(method)) node.handlers.set(method, handler);
+}
+
+/** Find the handlers for `segments` (literal first, then parameter, then a tail), with the captured params. */
+function lookup(node: TrieNode, segments: string[], index: number, params: string[]): { handlers: Map<string, Handler>; params: string[] } | null {
+  if (index === segments.length) {
+    if (node.handlers.size > 0) return { handlers: node.handlers, params };
+    if (node.rest !== null) return { handlers: node.rest, params: [...params, ''] };
+    return null;
+  }
+  const segment = segments[index];
+  const literal = node.literal.get(segment);
+  if (literal !== undefined) {
+    const found = lookup(literal, segments, index + 1, params);
+    if (found !== null) return found;
+  }
+  if (node.param !== null) {
+    const found = lookup(node.param, segments, index + 1, [...params, segment]);
+    if (found !== null) return found;
+  }
+  if (node.rest !== null) return { handlers: node.rest, params: [...params, segments.slice(index).join('/')] };
+  return null;
 }
 
 const R = '/repos/{owner}/{repo}';
@@ -856,19 +921,13 @@ on('GET', `${R}/pulls/{number}/reviews`, () => ({ status: 200, body: [] }));
 
 /** Dispatch one REST request (the path is relative to /api/v3). */
 export function route(req: RestRequest): RestAnswer {
-  let pathMatched = false;
-  for (const entry of routes) {
-    const match = entry.pattern.exec(req.path);
-    if (match === null) continue;
-    pathMatched = true;
-    if (entry.method !== req.method && !(req.method === 'HEAD' && entry.method === 'GET')) continue;
-    return entry.handler(req, match.slice(1).map((part) => part));
-  }
-  if (pathMatched) {
+  const found = lookup(trie, req.path.split('/').filter(Boolean), 0, []);
+  if (found !== null) {
+    const handler = found.handlers.get(req.method) ?? (req.method === 'HEAD' ? found.handlers.get('GET') : undefined);
+    if (handler !== undefined) return handler(req, found.params);
     // a known resource with a verb it does not take; a missing repository still reads as 404
     const repoMatch = /^\/repos\/([^/]+)\/([^/]+)/.exec(req.path);
     if (repoMatch !== null) getRepo(repoMatch[1], repoMatch[2]);
-    return { status: 404, body: { message: 'Not Found', documentation_url: 'https://docs.github.com/rest' } };
   }
   return { status: 404, body: { message: 'Not Found', documentation_url: 'https://docs.github.com/rest' } };
 }

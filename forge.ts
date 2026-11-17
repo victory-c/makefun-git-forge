@@ -61,8 +61,16 @@ export function tick(): number {
   return clock;
 }
 
+const isoCache = new Map<number, string>();
+
 export function isoOf(epochSec: number): string {
-  return new Date(epochSec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  let text = isoCache.get(epochSec);
+  if (text === undefined) {
+    text = new Date(epochSec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    if (isoCache.size > 200_000) isoCache.clear();
+    isoCache.set(epochSec, text);
+  }
+  return text;
 }
 
 // ------------------------------------------------------------------------------------- the model
