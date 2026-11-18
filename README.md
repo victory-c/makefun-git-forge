@@ -27,6 +27,7 @@ MAKEFUN_SHOP_TOKEN=secret PORT=8000 node main.ts
 ```sh
 node tests/inflate.mjs
 node tests/http.mjs
+node tests/smart.mjs
 ```
 
 The inflater differential test checks stored, fixed and dynamic DEFLATE streams
