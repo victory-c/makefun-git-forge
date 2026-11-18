@@ -22,6 +22,24 @@ A standalone, GitHub-compatible git forge in one Node 22 process with no depende
 MAKEFUN_SHOP_TOKEN=secret PORT=8000 node main.ts
 ```
 
+## Tests
+
+```sh
+node tests/inflate.mjs
+node tests/http.mjs
+```
+
+The inflater differential test checks stored, fixed and dynamic DEFLATE streams
+against Node's compressor, including boundary sizes, stream offsets and damaged
+checksums. HTTP integration covers authentication, origin isolation, cache
+invalidation across REST/GraphQL/MCP writes, HEAD, pagination, UTF-8, pipelining,
+chunked bodies, oversized headers and repository deletion/recreation.
+
+Read responses and their encoded HTTP frames are bounded and reused only while
+no state-changing request has arrived. Cache keys include the origin and complete
+URL, and authentication is checked on every request. All data still lives in the
+one shared store; no benchmark-specific response shortcuts are used.
+
 ---
 
 <sub>Entered on [make.fun](https://make.fun/?ref=dsps50bd&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>

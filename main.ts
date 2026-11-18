@@ -57,9 +57,39 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
 
 const GIT_PATH = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
+// Cache only successful, authenticated, bodyless REST reads. Every state-changing
+// request invalidates the entire cache, including writes through git, GraphQL and MCP.
+// Host and the complete URL are part of the key: origins, queries and pages never mix.
+const readResponses = new Map<string, RawResponse>();
+let readBytes = 0;
 function dispatch(req: RawRequest): RawResponse {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    mutations.epoch += 1;
+    readResponses.clear();
+    readBytes = 0;
+  }
+  const cacheable = req.method === 'GET' && req.body.length === 0 &&
+    req.url.startsWith('/api/v3/') && authorized(req.headers.authorization);
+  if (!cacheable) return serveRequest(req);
+  const key = `${req.headers.host ?? '127.0.0.1'}\n${req.url}`;
+  const previous = readResponses.get(key);
+  if (previous !== undefined) return previous;
+  const response = serveRequest(req);
+  const bytes = response.body === null ? 0 : Buffer.byteLength(response.body);
+  if (response.status === 200 && bytes <= 65536) {
+    if (readBytes + bytes > 4 * 1024 * 1024 || readResponses.size >= 512) {
+      readResponses.clear();
+      readBytes = 0;
+    }
+    response.reusable = true;
+    readResponses.set(key, response);
+    readBytes += bytes;
+  }
+  return response;
+}
+
+function serveRequest(req: RawRequest): RawResponse {
   const { method, url, headers } = req;
-  if (method !== 'GET' && method !== 'HEAD') mutations.epoch += 1;
   const q = url.indexOf('?');
   let path = q < 0 ? url : url.slice(0, q);
   const rawQuery = q < 0 ? '' : url.slice(q + 1);
@@ -121,7 +151,7 @@ function dispatch(req: RawRequest): RawResponse {
     else if (action === 'git-upload-pack' && method === 'POST') answer = uploadPack(owner, name, body, protocol);
     else if (action === 'git-receive-pack' && method === 'POST') answer = receivePack(owner, name, body);
     else return { status: 405, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: 'Method Not Allowed\n' };
-    return { status: answer.status, headers: answer.headers, body: answer.body };
+    return answer;
   }
 
   // ------------------------------------------------------------------ MCP

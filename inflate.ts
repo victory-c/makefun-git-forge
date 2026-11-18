@@ -25,9 +25,27 @@ interface Huffman {
 }
 
 const PRIMARY = 9;
+const REVERSED = new Uint16Array(1 << PRIMARY);
+for (let value = 0; value < REVERSED.length; value += 1) {
+  let reversed = 0;
+  for (let bit = 0; bit < PRIMARY; bit += 1) reversed = (reversed << 1) | ((value >>> bit) & 1);
+  REVERSED[value] = reversed;
+}
 
-function buildHuffman(lengths: ArrayLike<number>, count: number): Huffman {
-  const counts = new Int32Array(16);
+function workspace(capacity: number): Huffman {
+  return { table: new Int32Array(1 << PRIMARY), bits: PRIMARY, counts: new Int32Array(16), symbols: new Int32Array(capacity) };
+}
+// Inflation is synchronous and non-reentrant. Separate scratch tables for the
+// three dynamic alphabets eliminate per-object allocation without touching fixed tables.
+const dynamicLit = workspace(288);
+const dynamicDist = workspace(32);
+const dynamicLength = workspace(19);
+const offsets = new Int32Array(16);
+const nextCodes = new Int32Array(16);
+
+function buildHuffman(lengths: ArrayLike<number>, count: number, target?: Huffman): Huffman {
+  const counts = target?.counts ?? new Int32Array(16);
+  counts.fill(0);
   let maxLen = 0;
   for (let i = 0; i < count; i += 1) {
     const len = lengths[i];
@@ -36,14 +54,17 @@ function buildHuffman(lengths: ArrayLike<number>, count: number): Huffman {
   }
   counts[0] = 0;
   const bits = Math.max(1, Math.min(maxLen, PRIMARY));
-  const table = new Int32Array(1 << bits);
+  const table = target?.table ?? new Int32Array(1 << bits);
+  table.fill(0);
   // symbols in canonical order (by length, then by symbol)
-  const offsets = new Int32Array(16);
+  offsets.fill(0);
   for (let len = 1; len < 15; len += 1) offsets[len + 1] = offsets[len] + counts[len];
-  const symbols = new Int32Array(count);
+  const symbols = target?.symbols ?? new Int32Array(count);
+  symbols.fill(0);
   for (let symbol = 0; symbol < count; symbol += 1) if (lengths[symbol] !== 0) symbols[offsets[lengths[symbol]]++] = symbol;
   // first canonical code of each length
-  const next = new Int32Array(16);
+  const next = nextCodes;
+  next.fill(0);
   let code = 0;
   for (let len = 1; len <= 15; len += 1) {
     code = (code + counts[len - 1]) << 1;
@@ -55,10 +76,13 @@ function buildHuffman(lengths: ArrayLike<number>, count: number): Huffman {
     const assigned = next[len];
     next[len] += 1;
     // DEFLATE sends codes most-significant bit first; the table is indexed by bits as read (LSB first)
-    let reversed = 0;
-    for (let b = 0; b < len; b += 1) reversed |= ((assigned >> b) & 1) << (len - 1 - b);
+    const reversed = REVERSED[assigned] >>> (PRIMARY - len);
     const entry = (symbol << 4) | len;
-    for (let fill = reversed; fill < table.length; fill += 1 << len) table[fill] = entry;
+    for (let fill = reversed; fill < (1 << bits); fill += 1 << len) table[fill] = entry;
+  }
+  if (target !== undefined) {
+    target.bits = bits;
+    return target;
   }
   return { table, bits, counts, symbols };
 }
@@ -172,7 +196,7 @@ export function inflateZlib(input: Buffer, offset: number, expected: number): { 
       const hclen = take(4) + 4;
       const codeLengths = new Uint8Array(19);
       for (let i = 0; i < hclen; i += 1) codeLengths[ORDER[i]] = take(3);
-      const lengthCode = buildHuffman(codeLengths, 19);
+      const lengthCode = buildHuffman(codeLengths, 19, dynamicLength);
       const lengths = new Uint8Array(hlit + hdist);
       let at = 0;
       while (at < hlit + hdist) {
@@ -192,8 +216,8 @@ export function inflateZlib(input: Buffer, offset: number, expected: number): { 
           at += repeat;
         }
       }
-      lit = buildHuffman(lengths.subarray(0, hlit), hlit);
-      dist = buildHuffman(lengths.subarray(hlit), hdist);
+      lit = buildHuffman(lengths.subarray(0, hlit), hlit, dynamicLit);
+      dist = buildHuffman(lengths.subarray(hlit), hdist, dynamicDist);
     } else throw new InflateError('reserved block type');
 
     for (;;) {
@@ -223,9 +247,16 @@ export function inflateZlib(input: Buffer, offset: number, expected: number): { 
   if (adlerAt + 4 > input.length) throw new InflateError('missing adler-32');
   let a = 1;
   let b = 0;
-  for (let i = 0; i < expected; i += 1) {
-    a = (a + out[i]) % 65521;
-    b = (b + a) % 65521;
+  // NMAX=5552 bounds the unreduced sums below 2^32 even for 0xff bytes.
+  // Two reductions per block replace two divisions for every output byte.
+  for (let start = 0; start < expected; start += 5552) {
+    const end = Math.min(expected, start + 5552);
+    for (let i = start; i < end; i += 1) {
+      a += out[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
   }
   if (((b << 16) | a) >>> 0 !== input.readUInt32BE(adlerAt)) throw new InflateError('adler-32 mismatch');
   return { data: out, next: adlerAt + 4 };

@@ -25,12 +25,13 @@ export interface GitAnswer {
   status: number;
   headers: Record<string, string>;
   body: Buffer;
+  reusable: boolean;
 }
 
 const AGENT = 'agent=git/2.47.0-forge';
 
 function answer(status: number, contentType: string, body: Buffer): GitAnswer {
-  return { status, headers: { 'content-type': contentType, 'cache-control': 'no-cache', expires: 'Fri, 01 Jan 1980 00:00:00 GMT', pragma: 'no-cache' }, body };
+  return { status, headers: { 'content-type': contentType, 'cache-control': 'no-cache', expires: 'Fri, 01 Jan 1980 00:00:00 GMT', pragma: 'no-cache' }, body, reusable: true };
 }
 
 function notFound(): GitAnswer {
@@ -48,9 +49,28 @@ function sortedRefs(repo: Repo): [string, string][] {
 
 // ------------------------------------------------------------------------------------- info/refs
 
+const refAnswers = new WeakMap<Repo, { version: number; branch: string; entries: Map<string, GitAnswer> }>();
+function refAnswer(repo: Repo, key: string, build: () => GitAnswer): GitAnswer {
+  let cache = refAnswers.get(repo);
+  if (cache === undefined || cache.version !== repo.version || cache.branch !== repo.defaultBranch) {
+    cache = { version: repo.version, branch: repo.defaultBranch, entries: new Map() };
+    refAnswers.set(repo, cache);
+  }
+  const previous = cache.entries.get(key);
+  if (previous !== undefined) return previous;
+  const response = build();
+  if (cache.entries.size >= 64) cache.entries.clear();
+  cache.entries.set(key, response);
+  return response;
+}
+
 export function infoRefs(owner: string, name: string, service: string | null, gitProtocol: string): GitAnswer {
   const repo = findRepo(owner, name);
   if (repo === null) return notFound();
+  return refAnswer(repo, JSON.stringify([service, gitProtocol]), () => advertiseRefs(repo, service, gitProtocol));
+}
+
+function advertiseRefs(repo: Repo, service: string | null, gitProtocol: string): GitAnswer {
   if (service === 'git-upload-pack') {
     if (/version=2/.test(gitProtocol)) {
       const lines = [pkt('version 2\n'), pkt(`${AGENT}\n`), pkt('ls-refs=unborn\n'), pkt('fetch=shallow\n'), pkt('server-option\n'), pkt('object-format=sha1\n'), FLUSH];
@@ -92,7 +112,7 @@ interface FetchArgs {
   done: boolean;
 }
 
-const fetchCache = new Map<string, Buffer>();
+const fetchCache = new Map<string, GitAnswer>();
 
 export function uploadPack(owner: string, name: string, body: Buffer, gitProtocol: string): GitAnswer {
   const repo = findRepo(owner, name);
@@ -149,17 +169,21 @@ function v2Command(repo: Repo, packets: Packet[], body: Buffer): GitAnswer {
     }
     const cacheKey = `${repo.id}:${repo.version}:${createHash('sha1').update(body).digest('hex')}`;
     const cached = fetchCache.get(cacheKey);
-    if (cached !== undefined) return answer(200, 'application/x-git-upload-pack-result', cached);
-    const result = v2Fetch(parsed);
+    if (cached !== undefined) return cached;
+    const result = answer(200, 'application/x-git-upload-pack-result', v2Fetch(parsed));
     if (fetchCache.size > 256) fetchCache.clear();
     fetchCache.set(cacheKey, result);
-    return answer(200, 'application/x-git-upload-pack-result', result);
+    return result;
   }
   if (command === '') return answer(400, 'text/plain; charset=utf-8', Buffer.from('no command\n'));
   return answer(200, 'application/x-git-upload-pack-result', Buffer.concat([pkt(`ERR unknown command ${command}\n`), FLUSH]));
 }
 
 function lsRefs(repo: Repo, args: string[]): GitAnswer {
+  return refAnswer(repo, JSON.stringify(['ls-refs', args]), () => buildLsRefs(repo, args));
+}
+
+function buildLsRefs(repo: Repo, args: string[]): GitAnswer {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');

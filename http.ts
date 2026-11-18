@@ -19,6 +19,8 @@ export interface RawResponse {
   /** Lowercase header names; content-length is added here. */
   headers: Record<string, string>;
   body: Buffer | string | null;
+  /** Immutable answer eligible for transport-frame reuse. */
+  reusable?: boolean;
 }
 
 export type RawHandler = (req: RawRequest) => RawResponse;
@@ -48,7 +50,19 @@ const MAX_BODY = 768 * 1024 * 1024;
 const HEAD_END = Buffer.from('\r\n\r\n');
 
 /** One answer as bytes: status line, headers, content-length, then the body (none for HEAD). */
+const frames = new WeakMap<RawResponse, Buffer>();
 function render(res: RawResponse, keepAlive: boolean, isHead: boolean): Buffer | string {
+  if (!res.reusable || !keepAlive || isHead) return renderUncached(res, keepAlive, isHead);
+  let frame = frames.get(res);
+  if (frame === undefined) {
+    const output = renderUncached(res, true, false);
+    frame = typeof output === 'string' ? Buffer.from(output) : output;
+    frames.set(res, frame);
+  }
+  return frame;
+}
+
+function renderUncached(res: RawResponse, keepAlive: boolean, isHead: boolean): Buffer | string {
   const body = res.body ?? '';
   const length = typeof body === 'string' ? Buffer.byteLength(body) : body.length;
   let head = `HTTP/1.1 ${res.status} ${REASONS[res.status] ?? 'Status'}\r\n`;
@@ -103,6 +117,10 @@ function serve(socket: Socket, handler: RawHandler): void {
     while (!closed && buffered !== null && buffered.length > 0) {
       const buf: Buffer = buffered;
       const headEnd = buf.indexOf(HEAD_END);
+      if (headEnd > MAX_HEAD) {
+        fail(431);
+        return;
+      }
       if (headEnd < 0) {
         if (buf.length > MAX_HEAD) fail(431);
         return;
